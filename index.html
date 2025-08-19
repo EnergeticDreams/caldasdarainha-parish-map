@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Caldas da Rainha — Parishes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <!-- Overpass JSON -> GeoJSON -->
+  <script src="osmtogeojson.js"></script>
+  <!-- Turf (global: turf) -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .ui {
+      position: absolute; z-index: 1000; left: 10px; top: 10px;
+      display: grid; gap: 8px; grid-auto-flow: row;
+    }
+    .card {
+      background: rgba(255,255,255,.94); padding: 10px 12px; border-radius: 12px;
+      box-shadow: 0 4px 14px rgba(0,0,0,.12);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+    .title { font-weight: 700; font-size: 16px; margin-bottom: 6px; }
+    .sub { font-size: 12px; color:#555; }
+
+    /* Single-line label chips; measured for precise centering */
+    .label{
+      font-weight:700;
+      color:#1a1a1a;
+      text-shadow:0 1px 2px #fff;
+      pointer-events:none;
+      white-space:nowrap;      /* keep on one line */
+      display:inline-block;
+      padding:2px 4px;         /* subtle halo for readability */
+      background:rgba(255,255,255,.6);
+      border-radius:4px;
+      font-size:13px;
+      line-height:1.2;
+    }
+
+    .popup h3 { margin: 0 0 6px 0; font-size: 16px; }
+    .attribution {
+      position: absolute; z-index: 1000; right: 10px; bottom: 10px;
+      background: rgba(255,255,255,.92); padding: 6px 10px; border-radius: 8px; font-size: 12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+  </style>
+</head>
+<body>
+  <div class="ui">
+    <div class="card">
+      <div class="title">Caldas da Rainha — 12 Parishes</div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+  <div class="attribution">
+    © OpenStreetMap contributors • Data via Overpass API
+  </div>
+
+  <script>
+    // ---------- Leaflet ----------
+    const map = L.map('map', { zoomControl: true });
+    const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // ---------- Overpass query ----------
+    const overpassQL = `
+      [out:json][timeout:60];
+      // municipality -> area
+      relation
+        ["boundary"="administrative"]
+        ["name"="Caldas da Rainha"]
+        ["admin_level"~"7|8"];
+      map_to_area -> .searchArea;
+      // parishes inside municipality
+      (
+        relation(area.searchArea)
+          ["boundary"="administrative"]
+          ["admin_level"~"8|9"]
+          ["type"="boundary"];
+      );
+      out geom;
+    `.trim();
+
+    const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+
+    // ---------- Helpers ----------
+    function randomPastel(seed) {
+      let x = 0; for (let i=0;i<seed.length;i++) x = (x*31 + seed.charCodeAt(i)) >>> 0;
+      const r = 170 + (x & 0x2F), g = 170 + ((x>>5) & 0x2F), b = 170 + ((x>>10) & 0x2F);
+      return `rgb(${r},${g},${b})`;
+    }
+
+    function parishName(props) {
+      if (!props) return "—";
+      const t  = props.tags || {};
+      const rt = (props.relations && props.relations[0] && props.relations[0].reltags) || {};
+      return (
+        t.name || rt.name ||
+        t["official_name"] || rt["official_name"] ||
+        t["name:pt"] || rt["name:pt"] ||
+        t["name:en"] || rt["name:en"] ||
+        props.name || "—"
+      );
+    }
+
+    function safeHtmlLabel(name){
+      const esc = (name || '—')
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;');
+      return esc.replace(/\s+/g,'&nbsp;'); // one line
+    }
+
+    // Measure label size using current CSS
+    function measureLabel(html){
+      const el = document.createElement('div');
+      el.className = 'label';
+      el.style.position = 'absolute';
+      el.style.visibility = 'hidden';
+      el.style.left = '-9999px';
+      el.innerHTML = html;
+      document.body.appendChild(el);
+      const w = el.offsetWidth, h = el.offsetHeight;
+      el.remove();
+      return {w, h};
+    }
+
+    // Best interior point using Turf (guaranteed on-geometry)
+    function bestLabelPoint(geom){
+      try {
+        const feat = { type: 'Feature', properties: {}, geometry: geom };
+        const pt = turf.pointOnFeature(feat); // returns Feature<Point>
+        return pt.geometry.coordinates;        // [lng, lat]
+      } catch(e) {
+        return null;
+      }
+    }
+
+    // Collision avoidance in screen space (simple greedy nudge)
+    function placeLabels(features) {
+      // remove old labels
+      currentLabels.forEach(m => map.removeLayer(m));
+      currentLabels = [];
+
+      // Sort by bounds area so big parishes place first
+      const withBounds = features.map(f => {
+        const tmp = L.geoJSON(f);
+        const b = tmp.getBounds();
+        const area = (b.getEast()-b.getWest()) * (b.getNorth()-b.getSouth());
+        return { f, bounds: b, area };
+      }).sort((a,b)=>b.area - a.area);
+
+      const placed = []; // pixel rects: {x,y,w,h}
+      withBounds.forEach(item => {
+        const f = item.f;
+        const name = parishName(f.properties);
+        const html = safeHtmlLabel(name);
+        const size = measureLabel(html); // {w,h}
+
+        const ll = bestLabelPoint(f.geometry);
+        if (!ll) return;
+        const base = map.latLngToLayerPoint([ll[1], ll[0]]); // [lat,lng]
+
+        // try offsets to resolve overlaps
+        const steps = [0, 16, -16, 32, -32, 48, -48, 64, -64];
+        let chosen = null;
+        outer:
+        for (let dx of steps) {
+          for (let dy of steps) {
+            const rect = {
+              x: base.x - size.w/2 + dx,
+              y: base.y - size.h/2 + dy,
+              w: size.w,
+              h: size.h
+            };
+            // intersection test
+            let ok = true;
+            for (const r of placed) {
+              if (!(rect.x + rect.w < r.x || r.x + r.w < rect.x || rect.y + rect.h < r.y || r.y + r.h < rect.y)) {
+                ok = false; break;
+              }
+            }
+            if (ok) { chosen = {dx, dy, rect}; break outer; }
+          }
+        }
+        if (!chosen) chosen = {dx:0, dy:0, rect:{x: base.x - size.w/2, y: base.y - size.h/2, w:size.w, h:size.h}};
+        placed.push(chosen.rect);
+
+        const px = L.point(base.x + chosen.dx, base.y + chosen.dy);
+        const latlng = map.layerPointToLatLng(px);
+
+        const icon = L.divIcon({
+          className: 'label',
+          html,
+          iconSize: [size.w, size.h],
+          iconAnchor: [size.w/2, size.h/2]
+        });
+        const marker = L.marker(latlng, { icon, interactive:false, keyboard:false });
+        marker.addTo(map);
+        currentLabels.push(marker);
+      });
+    }
+
+    // ---------- Fetch + render ----------
+    let geo, parishLayer, currentLabels = [];
+    fetch(OVERPASS_URL, { method: "POST", body: overpassQL })
+      .then(r => r.json())
+      .then(osmJson => {
+        geo = osmtogeojson(osmJson);
+
+        // Normalize: copy relation tags into properties.tags when tags are missing
+        geo.features.forEach(f => {
+          const hasName = f.properties?.tags?.name;
+          const reltags = f.properties?.relations?.[0]?.reltags;
+          if (!hasName && reltags) {
+            f.properties.tags = Object.assign({}, reltags, f.properties.tags || {});
+          }
+        });
+
+        // Polygons only
+        geo.features = geo.features.filter(f => {
+          const gt = f.geometry?.type;
+          return gt === 'Polygon' || gt === 'MultiPolygon';
+        });
+
+        parishLayer = L.geoJSON(geo, {
+          style: f => ({
+            color: '#333',
+            weight: 1,
+            opacity: 1,
+            fillOpacity: 0.55,
+            fillColor: randomPastel(parishName(f.properties))
+          }),
+          onEachFeature: (feature, layer) => {
+            const name = parishName(feature.properties);
+            layer.bindPopup(`<div class="popup"><h3>${name}</h3></div>`);
+          }
+        }).addTo(map);
+
+        map.fitBounds(parishLayer.getBounds(), { padding: [20, 20] });
+        placeLabels(geo.features);
+
+        // Reposition labels on move/zoom (debounced)
+        let t=null;
+        function rerender(){ clearTimeout(t); t=setTimeout(()=>placeLabels(geo.features), 80); }
+        map.on('zoomend moveend', rerender);
+      })
+      .catch(err => {
+        console.error(err);
+        alert('Could not load parish boundaries from Overpass. Please retry.');
+      });
+  </script>
+</body>
+</html>
+
